@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Read-only OCI Backup & DR audit report for OCI Cloud Shell."""
-import argparse, csv
+import argparse, csv, random, time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,11 +16,29 @@ def all_results(label, func, *args, **kwargs):
 def client(cls, config, region):
     cfg=dict(config); cfg["region"]=region; return cls(cfg)
 
-def assignment(block, label, asset_id):
-    try: return block.get_volume_backup_policy_asset_assignment(asset_id=asset_id).data or []
-    except Exception as exc:
-        if getattr(exc,"status",None)==404: return []
-        ERRORS.append({"operation":label,"error":str(exc)}); print(f"[WARN] {label}: {exc}"); return []
+def assignment(block, label, asset_id, max_attempts=7, min_interval=0.12):
+    """Asset-driven assignment lookup with conservative OCI 429 handling."""
+    for attempt in range(1,max_attempts+1):
+        try:
+            result=block.get_volume_backup_policy_asset_assignment(asset_id=asset_id).data or []
+            time.sleep(min_interval)
+            return result
+        except Exception as exc:
+            status=getattr(exc,"status",None)
+            if status==404:
+                time.sleep(min_interval)
+                return []
+            if status==429 and attempt<max_attempts:
+                retry_after=None
+                headers=getattr(exc,"headers",None) or {}
+                try: retry_after=float(headers.get("retry-after")) if headers.get("retry-after") else None
+                except (TypeError,ValueError): retry_after=None
+                delay=retry_after if retry_after is not None else min(30.0,(2**(attempt-1))*0.75+random.uniform(0.0,0.75))
+                print(f"[RETRY] {label}: OCI 429 rate limit; waiting {delay:.2f}s (attempt {attempt}/{max_attempts})")
+                time.sleep(delay)
+                continue
+            ERRORS.append({"operation":label,"error":str(exc)}); print(f"[WARN] {label}: {exc}"); return []
+    return []
 
 def days(seconds): return round(seconds/86400,2) if seconds is not None else ""
 def iso(value): return value.isoformat() if value else ""
@@ -73,7 +91,6 @@ def main():
     print(f"[INFO] Tenancy: {tenancy.name}\n[INFO] Source: {a.source_region} | DR: {a.dr_region}\n[INFO] Accessible scope: {len(scope)} compartments including root")
     block=client(oci.core.BlockstorageClient,config,a.source_region)
 
-    # Policies and schedules. OCI assignment lookup is asset-driven, not policy-driven.
     for cid,cname in scope:
         for p in all_results(f"policies/{cname}",block.list_volume_backup_policies,compartment_id=cid):
             policy_by_id[p.id]=p.display_name
@@ -81,7 +98,6 @@ def main():
             for n,s in enumerate(p.schedules or [],1):
                 data["schedules"].append({"compartment":cname,"policy":p.display_name,"schedule":n,"backup_type":s.backup_type,"period":s.period,"day_of_week":s.day_of_week or "","day_of_month":s.day_of_month or "","month":s.month or "","hour_of_day":s.hour_of_day,"time_zone":s.time_zone or "","retention_days":days(s.retention_seconds),"prevent_deletion":getattr(s,"is_prevent_deletion_enabled",None),"retention_lock":getattr(s,"is_retention_lock_enabled",None)})
 
-    # Compute inventory from BOTH primary and DR regions.
     for region in dict.fromkeys([a.source_region,a.dr_region]):
         compute=client(oci.core.ComputeClient,config,region)
         for cid,cname in scope:
